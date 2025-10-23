@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Chat UI</title>
+  <style>
+    :root{--bg:#f5f7fa;--panel:#ffffff;--accent:#0b74de;--muted:#6b7280;--user:#0b74de;--bot:#eef2ff}
+    html,body{height:100%;margin:0;font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:#0f172a}
+    .app{display:grid;grid-template-columns:1fr 360px;gap:20px;max-width:1200px;margin:28px auto;padding:20px}
+    .panel{background:var(--panel);border-radius:12px;box-shadow:0 6px 18px rgba(15,23,42,0.06);display:flex;flex-direction:column;overflow:hidden}
+    header.app-header{padding:16px 20px;border-bottom:1px solid #eef2f6;display:flex;align-items:center;justify-content:space-between}
+    header.app-header h1{font-size:16px;margin:0}
+    .main{display:flex;flex-direction:column;min-height:480px}
+    .messages{flex:1;padding:20px;overflow:auto;display:flex;flex-direction:column;gap:12px}
+    .msg{max-width:78%;padding:10px 14px;border-radius:12px;line-height:1.4;font-size:14px}
+    .msg.user{align-self:flex-end;background:linear-gradient(180deg,var(--user),#0866c6);color:white;border-bottom-right-radius:6px}
+    .msg.bot{align-self:flex-start;background:var(--bot);color:#0f172a;border-bottom-left-radius:6px}
+    .meta{font-size:12px;color:var(--muted);margin-top:6px}
+    .composer{padding:14px;border-top:1px solid #eef2f6;display:flex;gap:10px;align-items:flex-end}
+    textarea#input{flex:1;resize:none;height:56px;padding:10px 12px;border-radius:8px;border:1px solid #e6eef8;font-size:14px}
+    button#send{background:var(--accent);color:#fff;border:none;padding:10px 16px;border-radius:8px;cursor:pointer}
+    button#newConv{background:#fff;color:var(--accent);border:1px solid #dbeafe;padding:8px 12px;border-radius:8px;cursor:pointer}
+    /* right history */
+    .history{width:360px;padding:0}
+    .history .header{padding:16px;border-bottom:1px solid #eef2f6;display:flex;justify-content:space-between;align-items:center}
+    .history-list{overflow:auto;max-height:600px}
+    .history-item{padding:12px 14px;border-bottom:1px solid #f1f5f9;cursor:pointer;display:flex;flex-direction:column}
+    .history-item .title{font-weight:600;color:#0f172a}
+    .history-item .sub{font-size:12px;color:var(--muted);margin-top:6px}
+    .history-item.active{background:linear-gradient(90deg, #f8fafc, #eef2ff)}
+    .timestamp{font-size:11px;color:var(--muted)}
+    .spinner{width:14px;height:14px;border-radius:50%;border:2px solid rgba(0,0,0,0.08);border-top-color:var(--accent);animation:spin 1s linear infinite;display:inline-block}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    /* responsive */
+    @media (max-width:950px){.app{grid-template-columns:1fr;padding:12px}.history{order:2;width:100%}.panel{min-height:420px}}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="panel main-panel panel" style="min-width:0">
+      <header class="app-header">
+        <h1>Professional Chat</h1>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button id="newConv">New Conversation</button>
+        </div>
+      </header>
+      <div class="main">
+        <div id="messages" class="messages" aria-live="polite"></div>
+        <div class="composer">
+          <textarea id="input" placeholder="Type your message — press Enter to send, Shift+Enter for newline"></textarea>
+          <button id="send">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <aside class="panel history" aria-label="Conversation history">
+      <div class="header">
+        <strong>History</strong>
+        <span class="timestamp" id="convCount">0</span>
+      </div>
+      <div id="historyList" class="history-list"></div>
+    </aside>
+  </div>
+
+  <script>
+    // Assumptions: we'll POST JSON { input: "<user message>", sessionId: "..." } to the webhook and the response will be JSON { output: "..." }
+    // const WEBHOOK_URL = 'https://flowveo.app.n8n.cloud/webhook/rag/os';
+     const WEBHOOK_URL = 'https://junaid8787.app.n8n.cloud/webhook/rag/os';
+    const STORAGE_KEY = 'chat_conversations_v1';
+    const SESSION_KEY = 'chat_session_id_v1';
+
+    // sessionId: stable per browser tab (sessionStorage) so it remains the same for a single tab,
+    // but differs between tabs and resets when the tab/session changes.
+    function getSessionId() {
+      try {
+        let s = sessionStorage.getItem(SESSION_KEY);
+        if (!s) {
+          s = 's_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,10);
+          sessionStorage.setItem(SESSION_KEY, s);
+        }
+        return s;
+      } catch (e) {
+        // Fallback to an in-memory id if sessionStorage is unavailable
+        if (!window.__CHAT_FALLBACK_SESSION) window.__CHAT_FALLBACK_SESSION = 's_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,10);
+        return window.__CHAT_FALLBACK_SESSION;
+      }
+    }
+
+    // Simple utilities
+    const $ = (sel, ctx = document) => ctx.querySelector(sel);
+    const $$ = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
+    const timeNow = () => new Date().toLocaleString();
+
+    // State
+    let conversations = []; // {id,title,createdAt,updatedAt,messages:[{role,text,time}]}
+    let activeId = null;
+
+    // Elements
+    const messagesEl = $('#messages');
+    const historyListEl = $('#historyList');
+    const inputEl = $('#input');
+    const sendBtn = $('#send');
+    const newConvBtn = $('#newConv');
+    const convCountEl = $('#convCount');
+
+    // Load from storage
+    function load() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        conversations = raw ? JSON.parse(raw) : [];
+      } catch (e) { conversations = []; }
+      if (!conversations || conversations.length === 0) {
+        const id = makeId();
+        conversations = [{ id, title: 'New conversation', createdAt: Date.now(), updatedAt: Date.now(), messages: [] }];
+        activeId = id;
+        persist();
+      } else {
+        activeId = conversations[0].id;
+      }
+    }
+
+    function persist() { localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations)); }
+
+    function makeId() { return 'c_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,8); }
+
+    function getActiveConv() { return conversations.find(c=>c.id===activeId); }
+
+    function renderMessages() {
+      const conv = getActiveConv();
+      messagesEl.innerHTML = '';
+      if (!conv) return;
+      conv.messages.forEach(m => messagesEl.appendChild(renderMessageEl(m)));
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function renderMessageEl(m) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot');
+      div.innerHTML = `<div>${escapeHtml(m.text)}</div><div class="meta">${m.time}</div>`;
+      if (m.loading) {
+        const spinner = document.createElement('span'); spinner.className = 'spinner';
+        div.querySelector('.meta').textContent = 'Sending… ';
+        div.querySelector('.meta').appendChild(spinner);
+      }
+      return div;
+    }
+
+    function renderHistory() {
+      historyListEl.innerHTML = '';
+      conversations.sort((a,b) => b.updatedAt - a.updatedAt);
+      convCountEl.textContent = conversations.length;
+      conversations.forEach(conv => {
+        const el = document.createElement('div');
+        el.className = 'history-item' + (conv.id === activeId ? ' active' : '');
+        const title = conv.title || (conv.messages[0] ? conv.messages[0].text.slice(0,50) : 'Conversation');
+        el.innerHTML = `<div class="title">${escapeHtml(title)}</div><div class="sub">Updated ${new Date(conv.updatedAt).toLocaleString()}</div>`;
+        el.onclick = () => { activeId = conv.id; renderHistory(); renderMessages(); };
+        historyListEl.appendChild(el);
+      });
+    }
+
+    function escapeHtml(str){
+      return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    async function sendMessage(text) {
+      if (!text || !text.trim()) return;
+      const conv = getActiveConv();
+      const userMsg = { role: 'user', text: text.trim(), time: timeNow() };
+      conv.messages.push(userMsg);
+      conv.updatedAt = Date.now();
+      // update title if first message
+      if (!conv.title || conv.title === 'New conversation') conv.title = text.trim().slice(0,60);
+      persist(); renderMessages(); renderHistory();
+
+      // add a loading bot message placeholder
+      const loadingMsg = { role: 'bot', text: '…', time: timeNow(), loading: true };
+      conv.messages.push(loadingMsg); persist(); renderMessages();
+
+  // prepare request (include per-tab sessionId)
+  const payload = { input: text.trim(), sessionId: getSessionId() };
+      const controller = new AbortController();
+      const timeout = setTimeout(()=>controller.abort(), 30000);
+
+      try {
+        sendBtn.disabled = true; inputEl.disabled = true; inputEl.blur();
+        const res = await fetch(WEBHOOK_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        });
+        clearTimeout(timeout);
+        if (!res.ok) throw new Error('Network response was not ok ('+res.status+')');
+        const data = await res.json();
+        const out = (data && data.output) ? data.output : JSON.stringify(data);
+        // replace loading message
+        conv.messages = conv.messages.map(m => m.loading ? { role:'bot', text: String(out), time: timeNow() } : m);
+      } catch (err) {
+        conv.messages = conv.messages.map(m => m.loading ? { role:'bot', text: 'Error: ' + (err.message || 'Request failed'), time: timeNow() } : m);
+      } finally {
+        sendBtn.disabled = false; inputEl.disabled = false; inputEl.focus();
+        conv.updatedAt = Date.now(); persist(); renderMessages(); renderHistory();
+      }
+    }
+
+    // UI wiring
+    sendBtn.addEventListener('click', ()=>{ const txt = inputEl.value; inputEl.value=''; sendMessage(txt); });
+    newConvBtn.addEventListener('click', ()=>{
+      const id = makeId();
+      const conv = { id, title: 'New conversation', createdAt: Date.now(), updatedAt: Date.now(), messages: [] };
+      conversations.unshift(conv); activeId = id; persist(); renderHistory(); renderMessages(); inputEl.focus();
+    });
+
+    // keyboard: Enter sends, Shift+Enter newline
+    inputEl.addEventListener('keydown', (e)=>{
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault(); const txt = inputEl.value; inputEl.value = ''; sendMessage(txt);
+      }
+    });
+
+    // initial render
+    load(); renderHistory(); renderMessages();
+
+    // Accessibility: focus input on load
+    window.addEventListener('load', ()=>{ inputEl.focus(); });
+  </script>
+</body>
+</html>
